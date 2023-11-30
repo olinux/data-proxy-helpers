@@ -1,0 +1,82 @@
+#!/bin/bash
+# Usage: ./download_from_data_proxy.sh 8fc108ab-e2b4-406f-8999-60269dc1f994 /tmp/download_from_dataproxy
+  
+DATASET=$1
+TARGET_DIR=$2
+ENDPOINT="https://data-proxy.ebrains.eu"
+
+
+
+# Authentication
+IAM_CONFIG="https://iam.ebrains.eu/auth/realms/hbp/.well-known/openid-configuration"
+CLIENT_ID="kg-core-python"
+
+IAM_CONFIG=$(curl -s  "$IAM_CONFIG")
+DEVICE_AUTH=$(echo "$IAM_CONFIG" | jq -r '.device_authorization_endpoint')
+TOKEN_AUTH=$(echo "$IAM_CONFIG" | jq -r '.token_endpoint')
+
+RESPONSE=$(curl -s -X 'POST' "$DEVICE_AUTH" -H "Content-Type: application/x-www-form-urlencoded" -d "client_id=$CLIENT_ID")
+VERIFICATION_CODE=$(echo "$RESPONSE" | jq -r '.verification_uri_complete')
+DEVICE_CODE=$(echo "$RESPONSE" | jq -r '.device_code')
+
+poll_for_token() {
+   POLL_RESPONSE=$(curl -s -X 'POST' "$TOKEN_AUTH" -d "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=$CLIENT_ID&device_code=$DEVICE_CODE" | jq -r '.')
+   ACCESS_TOKEN=$(echo "$POLL_RESPONSE" | jq -r .access_token)
+   REFRESH_TOKEN=$(echo "$POLL_RESPONSE" | jq -r .refresh_token)
+   EXPIRES_IN=$(echo "$POLL_RESPONSE" | jq -r .expires_in)
+}
+
+echo "************************************************************************"
+echo "To continue, you need to authenticate. To do so, please visit $VERIFICATION_CODE"
+echo "*************************************************************************"
+
+while :
+do
+   poll_for_token
+   if [ "$ACCESS_TOKEN" != "null" ]
+   then
+      ACCESS_TOKEN_TIMESTAMP=$(date +%s)
+      break
+   fi
+   sleep 5
+done
+
+update_token() {
+  CURRENT_TIMESTAMP=$(date +%s)
+  ACCESS_TOKEN_EXPIRATION=$(($ACCESS_TOKEN_TIMESTAMP+$EXPIRES_IN-60000))
+  if [ $CURRENT_TIMESTAMP -ge $ACCESS_TOKEN_EXPIRATION ]
+  then
+     echo "Refreshing the token"
+     REFRESH_RESPONSE=$(curl -s -X 'POST' "$TOKEN_AUTH" -d "grant_type=refresh_token&client_id=$CLIENT_ID&refresh_token=$REFRESH_TOKEN" | jq -r '.')
+     ACCESS_TOKEN=$(echo "$REFRESH_RESPONSE" | jq -r .access_token)
+     REFRESH_TOKEN=$(echo "$REFRESH_RESPONSE" | jq -r .refresh_token)
+     EXPIRES_IN=$(echo "$REFRESH_RESPONSE" | jq -r .expires_in)
+  fi
+}
+
+
+echo "Successfully authenticated"
+
+
+
+# Download
+
+# TODO: paginate beyond the max page of 10000
+IFS=$'\n'
+for file in $(curl -s -X 'GET' "$ENDPOINT/api/v1/datasets/$DATASET?limit=10000" -H "accept: application/json" -H "Authorization: Bearer $ACCESS_TOKEN" | jq -r '.objects[].name'); do
+   ABSOLUTE_PATH="$TARGET_DIR/$file"
+   if [ ! -f "$ABSOLUTE_PATH" ]
+   then
+      ENCODED_FILE=$(echo "$file" | sed "s^ ^%20^g")
+      update_token
+      DOWNLOAD_URL=$(curl -s -X 'GET' "$ENDPOINT/api/v1/datasets/$DATASET/$ENCODED_FILE?redirect=false" -H 'accept: application/json' -H "Authorization: Bearer $ACCESS_TOKEN" | jq -r .url)
+#      echo "Downloading $file from $DOWNLOAD_URL to $ABSOLUTE_PATH"
+      DIR=$(dirname "$ABSOLUTE_PATH")
+      mkdir -p "$DIR"
+      wget -q --show-progress "$DOWNLOAD_URL" -O "$TARGET_DIR/$file"
+   else
+      echo "Skipping download of $file because it already exists in the target directory"
+   fi
+
+done
+
